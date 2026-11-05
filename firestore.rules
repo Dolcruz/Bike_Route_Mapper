@@ -1,9 +1,139 @@
 rules_version = '2';
+
+// Zugriffsregeln für Bike Route Mapper.
+//
+// Grundsätze:
+// - Ohne Anmeldung kein Zugriff (wie bisher).
+// - Eigene Daten darf nur der Ersteller ändern oder löschen, der Admin alles.
+// - Freigaben (isApproved) und Admin-Markierungen setzt nur der Admin.
+// - Andere Nutzer dürfen eine freigegebene Route nur bewerten und einen
+//   Fahrradständer nur bestätigen, sonst nichts daran ändern.
+// - Alles, was hier nicht ausdrücklich erlaubt ist, ist verboten.
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Erlaube allen authentifizierten Benutzern vollen Zugriff auf die Datenbank
-    match /{document=**} {
-      allow read, write: if request.auth != null;
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && request.auth.token.email == 'pfistererfalk@gmail.com'
+        && request.auth.token.email_verified == true;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    // Felder, die sich bei einem Update geändert haben (inkl. neu/entfernt).
+    function changed() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    // Beim Anlegen darf ein Nicht-Admin ein Flag nur weglassen oder auf false setzen.
+    function flagFalseOrAbsent(field) {
+      return !(field in request.resource.data) || request.resource.data[field] == false;
+    }
+
+    // ---------------------------------------------------------------- Routen
+    match /routes/{routeId} {
+      // Lesen: eigene Routen, freigegebene Routen, Admin alles.
+      // Passt zu den Abfragen der App: where('userId', '==', uid),
+      // where('isApproved', '==', true) und den Admin-Abfragen.
+      allow read: if isAdmin()
+        || (signedIn() && (resource.data.userId == uid() || resource.data.get('isApproved', false) == true));
+
+      allow create: if isAdmin()
+        || (signedIn()
+            && request.resource.data.userId == uid()
+            && flagFalseOrAbsent('isApproved')
+            && flagFalseOrAbsent('isAdminRoute'));
+
+      allow update: if isAdmin()
+        || ownerRouteUpdate()
+        || ratingOnlyUpdate();
+
+      allow delete: if isAdmin()
+        || (signedIn() && resource.data.userId == uid());
+
+      // Eigentümer: alles außer Besitz und Freigabe.
+      function ownerRouteUpdate() {
+        return signedIn()
+          && resource.data.userId == uid()
+          && !changed().hasAny(['userId', 'isApproved', 'isAdminRoute']);
+      }
+
+      // Andere Nutzer: nur die eigene Bewertung einer freigegebenen Route.
+      function ratingOnlyUpdate() {
+        let before = resource.data.get('ratings', {});
+        let after = request.resource.data.get('ratings', {});
+        return signedIn()
+          && resource.data.get('isApproved', false) == true
+          && changed().hasOnly(['ratings', 'rating', 'ratingCount'])
+          && after.diff(before).affectedKeys().hasOnly([uid()])
+          && after[uid()] is number
+          && after[uid()] >= 1 && after[uid()] <= 5;
+      }
+    }
+
+    // ------------------------------------------------------ Nutzerstatistik
+    match /userStats/{userId} {
+      allow read: if isAdmin() || (signedIn() && userId == uid());
+      allow create, update: if signedIn() && userId == uid()
+        && request.resource.data.get('userId', uid()) == uid();
+      allow delete: if isAdmin() || (signedIn() && userId == uid());
+    }
+
+    // ------------------------------------------------------ Fahrradständer
+    match /bikeStands/{standId} {
+      // Kartendaten: alle angemeldeten Nutzer (die App lädt die ganze Sammlung).
+      allow read: if signedIn();
+
+      allow create: if isAdmin()
+        || (signedIn()
+            && request.resource.data.createdBy == uid()
+            && flagFalseOrAbsent('isApproved')
+            && flagFalseOrAbsent('isAdminCreated'));
+
+      allow update: if isAdmin()
+        || (signedIn()
+            && resource.data.createdBy == uid()
+            && !changed().hasAny(['createdBy', 'isApproved', 'isAdminCreated']))
+        || verifyOnlyUpdate();
+
+      allow delete: if isAdmin()
+        || (signedIn() && resource.data.createdBy == uid());
+
+      // Bestätigen durch andere: Zähler genau um 1 erhöhen, sonst nichts.
+      function verifyOnlyUpdate() {
+        let n = request.resource.data.get('verifications', 0);
+        return signedIn()
+          && changed().hasOnly(['verifications', 'isVerified'])
+          && n == resource.data.get('verifications', 0) + 1
+          && request.resource.data.get('isVerified', false) == (n >= 3);
+      }
+    }
+
+    // ------------------------------- Weitere Orte (POIs, Werkstätten, Laden)
+    // Gilt nur für die vier genannten Sammlungen; andere Pfade bleiben gesperrt.
+    match /{poiCollection}/{poiId} {
+      function isPoiCollection() {
+        return poiCollection in ['pois', 'repairStations', 'chargingStations', 'nextbikeStations'];
+      }
+      allow read: if isPoiCollection() && signedIn();
+      allow create: if isPoiCollection()
+        && (isAdmin() || (signedIn() && request.resource.data.createdBy == uid()));
+      allow update: if isPoiCollection()
+        && (isAdmin() || (signedIn() && resource.data.createdBy == uid() && !changed().hasAny(['createdBy'])));
+      allow delete: if isPoiCollection()
+        && (isAdmin() || (signedIn() && resource.data.createdBy == uid()));
+    }
+
+    // Zwischenspeicher der Nextbike-API: lesen ja, schreiben nur Admin.
+    match /nextbike_stations/{stationId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
     }
   }
-} 
+}
